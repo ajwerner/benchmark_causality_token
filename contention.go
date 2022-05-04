@@ -22,9 +22,11 @@ func main() {
 	var par int
 	var n int
 	var test string
+	var size int
 	flag.StringVar(&conn, "pgurl", "", "Connection port to CRDB cluster.")
-	flag.IntVar(&par, "par", 100, "asdf")
-	flag.IntVar(&n, "n", 10000, "asdf")
+	flag.IntVar(&par, "par", 100, "number of parallel workers")
+	flag.IntVar(&n, "n", 10000, "number of rows to insert")
+	flag.IntVar(&size, "size", 10000, "size of rows")
 	flag.StringVar(&test, "test", "withTxn", "one of withTxn, withSelect, raw")
 	flag.Parse()
 	ctx := context.Background()
@@ -58,7 +60,7 @@ func main() {
 		}
 	}
 
-	var op func(context.Context) error
+	var op func(context.Context, int) error
 	switch test {
 	case "raw":
 		op = raw(client)
@@ -68,40 +70,42 @@ func main() {
 		op = withTxn(client)
 	case "withToken":
 		op = withToken(client)
+	default:
+		logrus.Fatalf("unknown workload %s", test)
 	}
 
-	if err := do(ctx, n, par, op, test); err != nil {
+	if err := do(ctx, n, par, op, test, size); err != nil {
 		logrus.WithError(err).Fatal("failed to interact with CRDB")
 	}
 }
 
 // raw inserts, no contention since we have no SELECT
-func raw(client *pgxpool.Pool) func(ctx context.Context) error {
-	return func(ctx context.Context) error {
-		_, err := client.Exec(ctx, `INSERT INTO test (id) VALUES (DEFAULT);`)
-		return err
+func raw(client *pgxpool.Pool) func(ctx context.Context, size int) error {
+	return func(ctx context.Context, size int) error {
+		var id uuid.UUID
+		return client.QueryRow(ctx, `INSERT INTO kv (key, value) VALUES ($1, $2) RETURNING key;`, uuid.New().String(), strings.Repeat("x", size)).Scan(&id)
 	}
 }
 
 // withRead has a SELECT afterwards, no contention
-func withRead(client *pgxpool.Pool) func(ctx context.Context) error {
-	return func(ctx context.Context) error {
+func withRead(client *pgxpool.Pool) func(ctx context.Context, size int) error {
+	return func(ctx context.Context, size int) error {
 		var id uuid.UUID
-		err := client.QueryRow(ctx, `INSERT INTO test (id) VALUES (DEFAULT) RETURNING id;`).Scan(&id)
+		err := client.QueryRow(ctx, `INSERT INTO kv (key, value) VALUES ($1, $2) RETURNING key;`, uuid.New().String(), strings.Repeat("x", size)).Scan(&id)
 		if err != nil {
 			return err
 		}
 		var hybridLogicalTimestamp apd.Decimal
-		return client.QueryRow(ctx, `SELECT crdb_internal_mvcc_timestamp FROM test WHERE id=$1;`, id).Scan(&hybridLogicalTimestamp)
+		return client.QueryRow(ctx, `SELECT crdb_internal_mvcc_timestamp FROM kv WHERE key=$1;`, id).Scan(&hybridLogicalTimestamp)
 	}
 }
 
 // withTxn has a transaction on the insert, all of a sudden we see contention on the SELECT
-func withTxn(client *pgxpool.Pool) func(ctx context.Context) error {
-	return func(ctx context.Context) error {
+func withTxn(client *pgxpool.Pool) func(ctx context.Context, size int) error {
+	return func(ctx context.Context, size int) error {
 		var id uuid.UUID
 		if err := crdbpgx.ExecuteTx(ctx, client, pgx.TxOptions{}, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, `INSERT INTO kv (key, value) VALUES ($1, $2);`, uuid.New().String(), strings.Repeat("x", 10000)); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO kv (key, value) VALUES ($1, $2);`, uuid.New().String(), strings.Repeat("x", size)); err != nil {
 				return err
 			}
 
@@ -116,11 +120,11 @@ func withTxn(client *pgxpool.Pool) func(ctx context.Context) error {
 }
 
 // withTxn has a transaction on the insert, all of a sudden we see contention on the SELECT
-func withToken(client *pgxpool.Pool) func(ctx context.Context) error {
-	return func(ctx context.Context) error {
+func withToken(client *pgxpool.Pool) func(ctx context.Context, size int) error {
+	return func(ctx context.Context, size int) error {
 		var hybridLogicalTimestamp apd.Decimal
 		if err := crdbpgx.ExecuteTx(ctx, client, pgx.TxOptions{}, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, `INSERT INTO kv (key, value) VALUES ($1, $2);`, uuid.New().String(), strings.Repeat("x", 10000)); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO kv (key, value) VALUES ($1, $2);`, uuid.New().String(), strings.Repeat("x", size)); err != nil {
 				return err
 			}
 
@@ -135,8 +139,9 @@ func withToken(client *pgxpool.Pool) func(ctx context.Context) error {
 func do(
 	ctx context.Context,
 	iterations, parallelism int,
-	operation func(context.Context) error,
+	operation func(context.Context, int) error,
 	msg string,
+	size int,
 ) error {
 	var durations []time.Duration
 	sink := make(chan time.Duration, parallelism)
@@ -162,7 +167,7 @@ func do(
 	}()
 	if err := workers(ctx, iterations, parallelism, func(ctx context.Context) error {
 		before := time.Now()
-		err := operation(ctx)
+		err := operation(ctx, size)
 		duration := time.Since(before)
 		select {
 		case <-ctx.Done():
